@@ -12,7 +12,9 @@ Also requires external Python modules, install them with pip:
 
 watchdog -- To provide the ground file notification functionality
 filehash -- To provide a checksum hash of the files
-sqllite3 -- To persist info of what was processed
+sqlite3worker -- To persist info of what was processed 
+    and serialize all sql writes from multiple threads
+apsw -- sqlite3 api only that works well with multiple threads
 dataclasses -- To make it simple to persist Python objects into db
 flask -- To provide insight of what the service is doing via REST
 waitress -- Web server to serve flask application
@@ -25,8 +27,10 @@ import time
 import logging
 import sys
 import os
-import sqlite3
+import unittest
+import apsw
 
+from sqlite3worker import Sqlite3Worker
 from threading import Lock, Thread
 from logging.handlers import RotatingFileHandler
 from watchdog.observers import Observer
@@ -39,8 +43,9 @@ from dataclasses import dataclass, asdict
 from flask import Flask, render_template
 from datetime import datetime as dt
 from waitress import serve
+from enum import Enum
 
-VERSION = '0.6'
+VERSION = '0.7'
 WATCHEDDIRNAME = "watcheddir"
 WATCHEDDIRPARENT = "C:\\Temp\\watchdog"
 # Hardcode the absolute path to the watched directory
@@ -61,6 +66,136 @@ DBFILENAME = "watchdog.db"
 DBFILEPATH = os.path.join(TARGETDIRPARENT, DBFILENAME)
 
 NOT_MODIFIED_SINCE_X_SECONDS = 5.0
+
+#DB_API = 'sqlite3worker'
+DB_API = 'apsw'
+
+class DbApiException(Exception):
+    pass
+
+class DbApiBase:
+    def __init__(self, connection_string, db_api_choice):
+        self._conn_string = connection_string
+        self._db_api = db_api_choice
+        self._db = None
+
+    @property
+    def db(self):
+        return self._db
+
+    def initdb(self):
+        raise NotImplementedError
+
+    def execute(self, tid, *args, **kwargs):
+        raise NotImplementedError
+
+    def close(self):
+        raise NotImplementedError
+
+    def start_from_thread(self, tid):
+        return
+    
+    def end_from_thread(self, tid):
+        return
+
+    def execute_select_with_retry(self, tid, klass, sql, sql_params, retry=3):
+        if not sql.strip().lower().startswith('select'):
+            raise Exception('Must start with select')
+        if not isinstance(sql_params, dict):
+            raise Exception('sql parameters must be passed as dict')
+        loop_count = 0
+        res = None
+        while (res is None) and loop_count < retry:
+            for row in self.execute(tid, sql, sql_params):
+                res = klass(*row)
+                break
+            else:
+                time.sleep(1 + loop_count)
+                loop_count += 1
+        return res
+
+
+# To avoid being stuck with the default sqlite3 module which is not
+# fit for anything that is multithreaded and because we only intend to
+# use sqlite only, we have 2 options:
+# 1. sqlite3worker that will serialize everything so that only one thread uses sqlite.
+#    The problem with that module is that errors are just strings starting with 'Query returned error'
+# 2. apsw (another python sqlite wrapper) that will work as expected (but only for sqlite)
+#    This is the favorite approach with real exception converted to our DbApiException
+class DbApiSqlite3Worker(DbApiBase):
+    def __init__(self, connection_string, db_api_choice='sqlite3worker'):
+        super().__init__(connection_string, db_api_choice)
+        
+    def initdb(self):
+        self._db = Sqlite3Worker(self._conn_string)
+
+    def execute(self, tid, *args, **kwargs):
+        # tid not used here
+        if self._db is None:
+            raise Exception('Call initdb first')
+        return self._db.execute(*args, **kwargs)
+
+    def close(self):
+        if self._db is None:
+            raise Exception
+        self._db.close()
+        self._db = None
+
+
+class DbApiAPSW(DbApiBase):
+    def __init__(self, connection_string, db_api_choice='apsw'):
+        super().__init__(connection_string, db_api_choice)
+        self._cursors = {}
+        
+    def initdb(self):
+        self._db = apsw.Connection(self._conn_string)
+
+    def close(self):
+        if self._db is None:
+            raise Exception
+        self._db.close()
+        self._db = None
+
+    def start_from_thread(self, tid):
+        if tid not in self._cursors:
+            self._cursors[tid] = self._db.cursor()
+        else:
+            raise RuntimeError("%s has already an open cursor" % tid)
+
+    def end_from_thread(self, tid):
+        if tid in self._cursors:
+            self._cursors[tid].close()
+        else:
+            raise RuntimeError("%s does not have an open cursor" % tid)
+
+    def execute(self, tid, *args, **kwargs):
+        if self._db is None:
+            raise Exception('Call initdb first')
+        if tid not in self._cursors:
+            raise RuntimeError("%s does not have an open cursor, call start_from_thread first" % tid)
+        try:
+            res = self._cursors[tid].execute(*args, **kwargs)
+        except (apsw.SQLError, apsw.ConstraintError) as e:
+            raise DbApiException(e)
+        return res
+
+
+class DbApiSqlite:
+    def __init__(self, connection_string):
+        self._connection_string = connection_string
+        self._dbapi = None
+        if (DB_API == 'sqlite3worker'):
+            self._klass = DbApiSqlite3Worker
+        elif (DB_API == 'apsw'):
+            self._klass = DbApiAPSW
+        else:
+            raise NotImplementedError('Db API not recognized')
+    
+    def get_dbapi_obj(self):
+        self._dbapi_obj = self._klass(self._connection_string)
+        self._dbapi_obj.initdb()
+        return self._dbapi_obj
+
 
 class ThreadSafeDict(dict) :
     """
@@ -101,11 +236,94 @@ def is_file_copy_finished(file_path):
 
     return finished
 
+@dataclass
+class FilePropsItem:
+    id: int
+    filepath: str
+    hash_type: str
+    hash_value: str
+    create_t: int
+    last_update_t: int
+    status: int
+
+@dataclass
+class FilePropsItemCT(FilePropsItem):
+    newfilepath: str = ''
+
+TABLE_WQ = "workqueue"
+TABLE_CT = "completed_tasks"
+TABLE_CT_HIST = "completed_tasks_hist"
+
+SQL_CREATE_WQ = """
+    CREATE TABLE IF NOT EXISTS %s (
+            id INTEGER PRIMARY KEY,
+            filepath TEXT NOT NULL,
+            hash_type TEXT NOT NULL,
+            hash_value TEXT NOT NULL UNIQUE,
+            create_t INTEGER NOT NULL,  -- nb of seconds since epoch
+            last_update_t INTEGER NOT NULL, -- nb of seconds since epoch
+            status INTEGER NOT NULL
+    )
+""" % (TABLE_WQ)
+
+SQL_CREATE_CT_FMT = """
+    CREATE TABLE IF NOT EXISTS %s (
+            id INTEGER PRIMARY KEY,
+            filepath TEXT NOT NULL,
+            hash_type TEXT NOT NULL,
+            hash_value TEXT NOT NULL UNIQUE,
+            create_t INTEGER NOT NULL,  -- nb of seconds since epoch
+            last_update_t INTEGER NOT NULL, -- nb of seconds since epoch
+            status INTEGER NOT NULL,
+            newfilepath TEXT
+    )
+"""
+
+SQL_CREATE_CT = SQL_CREATE_CT_FMT % (TABLE_CT)
+SQL_CREATE_CT_HIST = SQL_CREATE_CT_FMT % (TABLE_CT_HIST)
+
+TABLE_WQ_COLS = "id, filepath, hash_type, hash_value, create_t, last_update_t, status"
+TABLE_CT_COLS = TABLE_WQ_COLS + ", newfilepath"
+
+SQL_SELECT_C_FROM_T_WHERE = """
+    SELECT %s FROM %s WHERE hash_value = :hash_value
+"""
+
+SQL_SELECT_C_FROM_T_WHERE_ID = """
+    SELECT %s FROM %s WHERE id = :id
+"""
+
+SQL_INSERT_INTO_T = """
+    INSERT INTO %s (filepath, hash_type, hash_value, create_t, last_update_t, status) VALUES (:filepath, :hash_type, :hash_value, :create_t, :last_update_t, :status) 
+"""
+
+# T1: TABLE_CT , T2: TABLE_CT_HIST
+SQL_COPY_FROM_T2_INTO_T1_WHERE_ID = """
+    INSERT INTO %s (filepath, newfilepath, hash_type, hash_value, create_t, last_update_t, status)
+        SELECT filepath, newfilepath, hash_type, hash_value, create_t, last_update_t, status FROM %s WHERE id = :id
+"""
+
+SQL_DELETE_FROM_T_WHERE = """
+    DELETE FROM %s WHERE id = :id
+"""
+
+SQL_UPDATE_T_SET_F_WHERE_ID = """
+    UPDATE %s SET %s = :value WHERE id = :id
+"""
+
+SQL_UPDATE_T_SET_F_WHERE_HASHVAL = """
+    UPDATE %s SET %s = :value WHERE hash_value = :hash_value
+"""
+
+class Status(Enum):
+    NA = -1
+    SUCCESS = 0
+    FAILURE = 1
+    PENDING = 2
+    UNKNOWN = 10
+
 
 class FileProperties:
-    """
-    Holds the properties of the files that we are interested in
-    """
     FILEHASHERS =  { 'md5': FileHash('md5'), 'sha256': FileHash('sha256') }
 
     def __init__(self, filepath, hash_type='sha256'):
@@ -160,6 +378,10 @@ class FileProperties:
         return 'filepath: %s, complete: %s, modified: %s, %s hash: %s' % (
             self._filepath, self._complete, self._modified , self._hash_type, self._hash_value
         )
+
+    def asdataclass(self):
+        dc = FilePropsItem(-1, self._filepath, self._hash_type, self._hash_value, self._ts, self._ts, Status.NA.value)
+        return dc
 
 
 class BaseWinservice(win32serviceutil.ServiceFramework):
@@ -292,6 +514,7 @@ class WatchdogSvc(BaseWinservice):
     def _configure_logging(self):
         l = logging.getLogger()
         l.setLevel(logging.DEBUG)
+        #l.setLevel(logging.ERROR)
         f = logging.Formatter('%(asctime)s %(process)d:%(thread)d %(name)s %(levelname)-8s %(message)s')
         h=logging.StreamHandler(sys.stdout)
         h.setLevel(logging.NOTSET)
@@ -302,21 +525,42 @@ class WatchdogSvc(BaseWinservice):
         h.setFormatter(f)
         l.addHandler(h)
 
+    def _init_db(self):
+        dbapi = DbApiSqlite(DBFILEPATH).get_dbapi_obj()
+        dbapi.start_from_thread('main')
+        return dbapi
+
     def _main(self):
+        self._dbapi = None
         try:
+            self._log("Start v%s at %s" % (VERSION, time.ctime()))
+            self._log("Start db worker...")
+            self._dbapi = self._init_db()
             self._log("Start background threads...")
             # background thread for processing the work in WORKQUEUE
-            background_t = Thread(target=background_thread_processing, args=({'tid': 'bg-1', 'log': self._log2, 'logerr': self._log_error2},), daemon=True)
+            background_t = Thread(
+                target=background_thread_processing,
+                args=({'tid': 'bg-1',
+                        'log': self._log2,
+                        'logerr': self._log_error2,
+                        'dbapi': self._dbapi
+                },),
+                daemon=True
+            )
             background_t.start()
+            self._log("Start Flask...")
             flask_t = Thread(
                 target=flask_thread_processing,
-                args=({'tid': 'ft-1', 'log': self._log2, 'logerr': self._log_error2, 'logexc': self._svc_excepthook},),
+                args=({'tid': 'ft-1',
+                        'log': self._log2,
+                        'logerr': self._log_error2,
+                        'logexc': self._svc_excepthook,
+                        'dbapi': self._dbapi
+                },),
                 daemon=True
             )
             flask_t.start()
-            self._log("Start background threads DONE")
 
-            self._log("Start v%s at %s" % (VERSION, time.ctime()))
             self._log(LOGFILEPATH)
             self._log("Watching dir: %s" % WATCHEDDIRPATH)
             self._log("Target dir: %s" % TARGETDIRPATH)
@@ -356,12 +600,7 @@ class WatchdogSvc(BaseWinservice):
                             ACTIVE_FILES[k].modified = False
                     elif ACTIVE_FILES[k].hash_value == None:
                         ACTIVE_FILES[k].hash_file()
-                        # apped to workqueue
-                        WORKQUEUE.append(k)
-                        WORKQUEUE.append(k)
-                        WORKQUEUE.append(k)
-                        WORKQUEUE.append(k)
-                        WORKQUEUE.append(k)
+                        self._add_to_workqueue(ACTIVE_FILES[k])
                         # mark for removal from pending
                         mark4removal = True
 
@@ -380,6 +619,33 @@ class WatchdogSvc(BaseWinservice):
 
         except Exception as e:
             self._svc_excepthook(*sys.exc_info())
+        
+        finally:
+            if self._dbapi:
+                self._dbapi.end_from_thread('main')
+                self._dbapi.close()
+
+    def _add_to_workqueue(self, fp):
+        if not isinstance(fp, FileProperties):
+            return
+        if self._dbapi is None:
+            return
+        self._log("[DEBUG] Add to workqueue")
+        results = self._dbapi.execute('main', "select * from workqueue where hash_value = ?", (fp.hash_value,))
+        # One way to detect an error in execute is to check the type of the returned value
+        # it is a string, that is an error message otherwise its a sequence/list, it can be empty
+        if isinstance(results, str):
+            self._log("[DEBUG] returning a string?!")
+            return
+        found = 0
+        for row in results:
+            print('[DEBUG]', row)
+            found += 1
+        if found == 0:
+            self._dbapi.execute('main', SQL_INSERT_INTO_T % (TABLE_WQ), asdict(fp.asdataclass()))
+        self._log("[DEBUG] Adding %s to wk" % str(fp))
+        WORKQUEUE.append(fp.asdataclass())
+
 
 class BaseBackgroundTask:
     """
@@ -388,8 +654,8 @@ class BaseBackgroundTask:
     and return False. Otherwise, True on success.
     """
     def __init__(self, argdict):
-        self._id = argdict['id']
-        self._f = argdict['f']
+        self._item = argdict['item']
+        self._id = self._item.id
         self._t = argdict['t']
         self._has_error = False
         self._log = argdict['log']
@@ -404,7 +670,7 @@ class BaseBackgroundTask:
         """
         Execute a task, handles error(s) and returns True on success, False otherwise
         """
-        self._log('[%d] processing %s...' % (self._id, str(self._f)))
+        self._log('[%d] processing %s...' % (self._id, str(self._item)))
         self._pre_exec()
         try:
             time.sleep(self._t)
@@ -413,10 +679,10 @@ class BaseBackgroundTask:
         else:
             self._on_sucess()
         finally:
-            msg = '[%d] done. (%s)' % (self._id, self._has_error)
+            msg = '[%d] done. (has_error = %s)' % (self._id, self._has_error)
             self._log(msg)
         self._post_exec()
-        return not self._has_error
+        return (not self._has_error, self._item)
 
     def _on_error(self, e):
         self._has_error = True
@@ -473,18 +739,22 @@ def background_thread_processing(args):
     I instanciate X workers and I wait until I have a token to pass the work from the
     workqueue to the workers
     """
-    log = args['log'] or None
+    log = args['log']
+    dbapi = args['dbapi']
+    tid = args['tid']
+    dbapi.start_from_thread(tid)
 
     log('This is a test from background_thread_processing')
 
+    pending_workqueue_items = {}
     background_tasks = []
-    id = 0
 
     tg = TokenGenerator(max_token=2, max_slot_time=60.0)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         while True:
-            del background_tasks[:]
+            pending_workqueue_items.clear()
+            background_tasks.clear()
 
             # When there is work to do and some workers are available
             while (len(WORKQUEUE) > 0) and (len(background_tasks) < MAX_WORKERS):
@@ -494,46 +764,105 @@ def background_thread_processing(args):
                     # We did not get a valid token, wait
                     break
                 f = WORKQUEUE.popleft()
-                background_tasks.append(BaseBackgroundTask({'id': token, 'f': f, 't': 5, 'log': log}))
+                # Get the id from the table workqueue to pass it to the background_tasks
+                # 2 possible error cases, (1) nothing was returned by the select (race?)
+                # (2) an exception was thrown
+                itemWQ = None
+                try:
+                    itemWQ = dbapi.execute_select_with_retry(tid, FilePropsItem, SQL_SELECT_C_FROM_T_WHERE % (TABLE_WQ_COLS, TABLE_WQ), {'hash_value': f.hash_value}, 3)
+                    if not isinstance(itemWQ, FilePropsItem):
+                        # Error
+                        break
+                except DbApiException:
+                    # Error
+                    break
+                # Create a bg task pass it a FilePropsItemCT copied from immutable FilePropsItem
+                itemCT = FilePropsItemCT(**asdict(itemWQ))
+                background_tasks.append(BaseBackgroundTask({'item': itemCT, 't': 5, 'log': log}))
+                # Key: ID int, Value: FilePropsItemCT
+                pending_workqueue_items[itemWQ.id] = itemCT
 
             # Create futures for all background_tasks
             futures = [executor.submit(bt.execute) for bt in background_tasks]
             if futures:
-                # Wait until all background tasks are completed
+                # Wait until all background tasks are completed and save the results into completed tasks table
                 for fut in as_completed(futures):
-                    res = fut.result()
+                    res, itemCT = fut.result()
+                    log("fut res = %s" % res)
+                    # Insert into completed tasks table (a different identity/id might be used) but the hash must be unique
+                    # We use the hash_value to know which row to update with the result,etc.
+                    log(str(asdict(itemCT)))
+                    try:
+                        dbapi.execute(tid, SQL_INSERT_INTO_T % (TABLE_CT), asdict(itemCT))
+                    except DbApiException as e:
+                        log(e)
+                    #item_CT_HIST = None
+                    #while itemCT_HIST is None:
+                    #    time.sleep(0.5)
+                    
+                    itemCT.newfilepath = 'filepath_after_processing'
+                    
+                    dbapi.execute(tid, SQL_UPDATE_T_SET_F_WHERE_HASHVAL % (TABLE_CT, 'filepath'), {'value': itemCT.filepath, 'hash_value': itemCT.hash_value})
+                    dbapi.execute(tid, SQL_UPDATE_T_SET_F_WHERE_HASHVAL % (TABLE_CT, 'newfilepath'), {'value': itemCT.newfilepath, 'hash_value': itemCT.hash_value})
+                    dbapi.execute(tid, SQL_UPDATE_T_SET_F_WHERE_HASHVAL % (TABLE_CT, 'last_update_t'), {'value': time.time(), 'hash_value': itemCT.hash_value})
+                    dbapi.execute(tid, SQL_UPDATE_T_SET_F_WHERE_HASHVAL % (TABLE_CT, 'status'),
+                        {'value': (Status.SUCCESS.value if res else Status.FAILURE.value), 'hash_value': itemCT.hash_value})
+                    # remove item from workqueue
+                    for (key, value) in pending_workqueue_items.items():
+                        if value == itemCT:
+                            dbapi.execute(tid, SQL_DELETE_FROM_T_WHERE % (TABLE_WQ), {'id': key})
+                            break
 
             # Wait
             time.sleep(1)
+
+    # FIXME: should call these for cleanup
+    dbapi.end_from_thread(tid)
+    dbapi.close()
 
 
 def flask_thread_processing(args):
     """
     I serve a Flask application
     """
-    tid = args['tid'] or ''
-    log = args['log'] or _
-    logerr = args['logerr'] or _
-    logexc = args['logexc'] or _
+    tid = args['tid']
+    log = args['log']
+    #logerr = args['logerr']
+    logexc = args['logexc']
+    dbapi = args['dbapi']
+    dbapi.start_from_thread(tid)
 
     try:
 
-        log('Hello from Flask thread')
+        log('Hello from Flask thread %s' % tid)
 
         app = Flask('flask_thread_processing')
         @app.route('/')
         def get_root():
             now_time = dt.now().strftime('%Y-%m-%d %H:%M:%S')
-            msg = "%s current time: %s" % (app.name, now_time)
+            msg = "%s current time: %s<br>" % (app.name, now_time)
             return msg
 
         @app.route('/status')
         def get_status():
-            resp = ''
+            now_time = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            resp = "%s current time: %s<br>" % (app.name, now_time)
             resp += "len(ACTIVE_FILES): %d" % len(ACTIVE_FILES) + '<br>'
             resp += 'ACTIVE_FILES:<br>'
             for af in ACTIVE_FILES:
                 resp += "%s<br>" % str(ACTIVE_FILES[af])
+            return resp
+
+        @app.route('/test')
+        def get_test():
+            now_time = dt.now().strftime('%Y-%m-%d %H:%M:%S')
+            resp = "%s current time: %s<br>" % (app.name, now_time)
+            #for row in dbapi.execute(tid, "select * from %s" % (TABLE_CT)):
+            sql = "SELECT %s FROM %s WHERE last_update_t > %d LIMIT %d" % (TABLE_CT_COLS, TABLE_CT, time.time() - 600, 10)
+            for row in dbapi.execute(tid, sql):
+                resp += 'get_test: ' + str(row) + '<br>'
+                item = FilePropsItemCT(*row)
+                resp += "%s<br>" % str(item)
             return resp
 
         # Flask has its own dev web server not suitable for production
@@ -546,22 +875,25 @@ def flask_thread_processing(args):
         serve(app, host='127.0.0.1', port=8080)
 
 
-    except Exception as e:
-        #logerr("[%s] Something fishy just happened... %s" % (tid, str(e)))
+    except Exception:
         logexc(*sys.exc_info())
 
     finally:
         log('Exiting...')
+        dbapi.end_from_thread(tid)
+        dbapi.close()
 
 
-def run_tests():
-    def test_dirs():
+class ThisIsMyUnitTests(unittest.TestCase):
+
+    def setUp(self):
+        pass
+
+    def test_dirs(self):
         for d in DIRSTOCHECK:
-            assert os.path.isdir(d), '%s does not exists' % d
-        print('dirs OK')
-        return True
+            self.assertTrue(os.path.isdir(d), '%s does not exists' % d)
 
-    def test_tokengen():
+    def test_tokengen(self):
         c_max_token = 5
         c_max_slot_t = 0.1
         i = 0
@@ -570,58 +902,171 @@ def run_tests():
         tg = TokenGenerator(max_token=c_max_token, max_slot_time=c_max_slot_t)
         while 1:
             last_res = res
-            #print(str(tg))
             res = tg.get_token()
-            #print(res)
             time.sleep(0.001)
             if (i < (c_max_token - 1) or (i > c_max_token and i <= (2*c_max_token))):
-                assert (res > last_res), '%d %d' % (res, last_res)
+                self.assertTrue((res > last_res), '%d %d' % (res, last_res))
             elif (i == c_max_token):
-                assert (res == -1), '%d' % res
+                self.assertTrue((res == -1), '%d' % res)
                 time.sleep(c_max_slot_t)
             elif (res > 2*c_max_token):
                 break
             i += 1
-        print('tokengen OK')
-        return True
 
-    def test_db():
-        conn = None
-        try:
-            conn = sqlite3.connect(DBFILEPATH)
-        except sqlite3.Error as e:
-            print(e)
-            return False
-        finally:
-            if conn:
-                conn.close()
-        print('sqlite3 OK: %s (%s)' % (sqlite3.version, DBFILEPATH))
-        return True
+    def test_db(self):
+        tid = 'main'
+        dbapi = DbApiSqlite(DBFILEPATH).get_dbapi_obj()
+        dbapi.start_from_thread(tid)
+        dbapi.execute(tid, SQL_CREATE_WQ)
+        dbapi.execute(tid, SQL_CREATE_CT)
+        dbapi.execute(tid, SQL_CREATE_CT_HIST)
+        dbapi.end_from_thread(tid)
+        dbapi.close()
 
-    def test_fileprops():
+    def test_fileprops(self):
         file1 = FileProperties(DBFILEPATH)
         file1.hash_file()
-        print(str(file1), 'OK')
+        asdict(file1.asdataclass())
+
+    def test_error_in_dpapi_execute(self):
+        # This will not raise any error/exception, it will only print
+        # print an error message starting wing "Query returned error:..."
+        tid = 'main'
+        dbapi = DbApiSqlite(':memory:').get_dbapi_obj()
+        dbapi.start_from_thread(tid)
+        try:
+            dbapi.execute(tid, 'insert into bad sql')
+        except DbApiException:
+            pass
+        finally:
+            # Check the output for "Query returned error"
+            dbapi.end_from_thread(tid)
+            dbapi.close()
+
+    def _test_create_insert_select_delete_T(self, T):
+        dbapi = DbApiSqlite(':memory:').get_dbapi_obj()
+        tid = 'main'
+        dbapi.start_from_thread(tid)
+        #conn.row_factory = sqlite3.Row  #this for getting the column names in dict(row)
+        item1 = FilePropsItem(-1, 'dummy_filepath1', 'dummy_hashtype1', 'dummy_hash_value1', 1, 2, Status.SUCCESS.value)
+        item2 = FilePropsItem(-1, 'dummy_filepath2', 'dummy_hashtype2', 'dummy_hash_value2', 0, 0, Status.FAILURE.value)
+        try:
+            # Create
+            if T == TABLE_WQ:
+                C = TABLE_WQ_COLS
+                dbapi.execute(tid, SQL_CREATE_WQ)
+                klass = FilePropsItem
+            elif T == TABLE_CT:
+                C = TABLE_CT_COLS
+                dbapi.execute(tid, SQL_CREATE_CT)
+                klass = FilePropsItemCT
+
+            # Insert
+            for item in [item1, item2]:
+                dbapi.execute(tid, SQL_INSERT_INTO_T % (T), asdict(item))
+
+            # Select
+            results = dbapi.execute(tid, SQL_SELECT_C_FROM_T_WHERE % (C, T), {'hash_value': 'dummy_hash_value1'})
+            self.assertTrue(len(results) == 1)
+            item = None
+            for row in results:
+                item = klass(*row)
+                self.assertTrue(isinstance(item, FilePropsItem))
+                self.assertTrue(item.id == 1)
+                self.assertTrue(item.filepath == 'dummy_filepath1')
+                self.assertTrue(item.hash_type == 'dummy_hashtype1')
+                self.assertTrue(item.hash_value == 'dummy_hash_value1')
+                self.assertTrue(item.create_t == 1)
+                self.assertTrue(item.last_update_t == 1)
+                self.assertTrue(item.status == Status.SUCCESS.value)
+                break
+            else:
+                raise Exception("No results found")
+
+            # Update
+            dbapi.execute(tid, SQL_UPDATE_T_SET_F_WHERE_ID % (T, 'last_update_t'), {'value': time.time(), 'id': item.id})
+            dbapi.execute(tid, SQL_UPDATE_T_SET_F_WHERE_HASHVAL % (T, 'last_update_t'), {'value': time.time(), 'hash_value': item.hash_value})
+
+            # Delete
+            dbapi.execute(tid, SQL_DELETE_FROM_T_WHERE % (T), {'id': item.id})
+            results = dbapi.execute(tid, SQL_SELECT_C_FROM_T_WHERE % (C, T), {'hash_value': 'dummy_hash_value1'})
+            self.assertTrue(len(results) == 0)
+
+        except Exception:
+            return False
+        finally:
+            dbapi.end_from_thread(tid)
+            dbapi.close()
         return True
 
-    def test_dataclasses():
-        @dataclass
-        class Item:
-            id: int
-            filepath: str
-            checksum: str
-            create_t: int
-            last_update_t: int
-            status: int    
-        item1 = Item(-1, 'gdfgd', '54dfd', 0, 0, -1)
-        asdict(item1)
-        print('dataclasses OK')
+    def test_create_insert_select_delete_CT(self):
+        return self._test_create_insert_select_delete_T(TABLE_CT)
 
-    test_tokengen()
-    test_dirs()
-    test_db()
-    test_fileprops()
-    test_dataclasses()
+    def test_create_insert_select_delete_WQ(self):
+        return self._test_create_insert_select_delete_T(TABLE_WQ)
+
+    def test_select_with_retry(self):
+        tid = 'main'
+        dbapi = DbApiSqlite(':memory:').get_dbapi_obj()
+        dbapi.start_from_thread(tid)
+        dbapi.execute(tid, SQL_CREATE_CT)
+        item1 = FilePropsItemCT(-1, 'dummy_filepath', 'dummy_hashtype', 'dummy_hash_value1', 1, 2, Status.SUCCESS.value)
+        dbapi.execute(tid, SQL_INSERT_INTO_T % (TABLE_CT), asdict(item1))
+        retry = 3
+        itemCT = dbapi.execute_select_with_retry(tid, FilePropsItemCT, SQL_SELECT_C_FROM_T_WHERE_ID % (TABLE_CT_COLS, TABLE_CT), {'id': 1}, retry)
+        self.assertTrue(itemCT is not None)
+        self.assertEqual(itemCT.id, 1)
+        self.assertEqual(itemCT.filepath, 'dummy_filepath')
+        self.assertEqual(itemCT.hash_type,'dummy_hashtype')
+        self.assertEqual(itemCT.hash_value,'dummy_hash_value1')
+        self.assertEqual(itemCT.create_t, 1)
+        self.assertEqual(itemCT.last_update_t, 2)
+        self.assertEqual(itemCT.status, Status.SUCCESS.value)
+        dbapi.end_from_thread(tid)
+        dbapi.close()
+
+    def _test_copy_from_T_to_T(self, T):
+        tid = 'main'
+        dbapi = DbApiSqlite(':memory:').get_dbapi_obj()
+        dbapi.start_from_thread(tid)
+        dbapi.execute(tid, SQL_CREATE_CT)
+        dbapi.execute(tid, SQL_CREATE_CT_HIST)
+        item1 = FilePropsItemCT(-1, 'dummy_filepath', 'dummy_newfilepath', 'dummy_hashtype', 'dummy_hash_value1', 0, 0, Status.NA.value)
+        dbapi.execute(tid, SQL_INSERT_INTO_T % (TABLE_CT), asdict(item1))
+        itemCT = None
+        itemCT_HIST = None
+        retry = 5
+        try:
+            # This code construct is not necessary when working directly in memory, however, it is used a lot when
+            # using the file-based database. Id must be equal to 1 since there was no other rows in the table before
+            while (itemCT is None) and (retry != 0):
+                for row in dbapi.execute(tid, SQL_SELECT_C_FROM_T_WHERE_ID % (TABLE_CT_COLS, TABLE_CT), {'id': 1}):
+                    itemCT = FilePropsItemCT(*row)
+                    break
+                else:
+                    time.sleep(0.5)
+                    retry -= 1
+            dbapi.execute(tid, SQL_COPY_FROM_T2_INTO_T1_WHERE_ID % (TABLE_CT_HIST, TABLE_CT), {'id': 1})
+            retry = 5
+            while (itemCT_HIST is None) and (retry != 0):
+                for row in dbapi.execute(tid, SQL_SELECT_C_FROM_T_WHERE_ID % (TABLE_CT_COLS, TABLE_CT_HIST), {'id': 1}):
+                    itemCT_HIST = FilePropsItemCT(*row)
+                    break
+                else:
+                    time.sleep(0.5)
+                    retry -= 1
+            self.assertTrue(itemCT_HIST is not None)
+            #print(asdict(itemCT_HIST))
+        finally:
+            dbapi.end_from_thread(tid)
+            dbapi.close()
+
+    def test_copy_from_CT_to_CT(self):
+        return self._test_copy_from_T_to_T(TABLE_CT)
+
+    def test_copy_from_WQ_to_WQ(self):
+        return self._test_copy_from_T_to_T(TABLE_WQ)
+
 
 if __name__ == '__main__':
     _cls = WatchdogSvc
@@ -646,6 +1091,5 @@ if __name__ == '__main__':
             if sys.argv[1] == 'help':
                 sys.argv = sys.argv[:1]
             elif (sys.argv[1] == 'test') or (sys.argv[1] == 'tests'):
-                run_tests()
-                sys.exit(0)
+                unittest.main(argv=['first-arg-is-ignored'], exit=True)
         _cls.parse_command_line()
