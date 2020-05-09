@@ -212,6 +212,7 @@ class ThreadSafeDict(dict) :
     def __exit__(self, type, value, traceback) :
         self._lock.release()
 
+
 ACTIVE_FILES = ThreadSafeDict()
 WORKQUEUE = deque()
 
@@ -454,6 +455,7 @@ class CustomEventHandler(FileSystemEventHandler):
         self._log = log_func
 
     def on_created(self, event):
+        global ACTIVE_FILES
         super().on_created(event)
 
         if os.path.isdir(event.src_path):
@@ -462,41 +464,44 @@ class CustomEventHandler(FileSystemEventHandler):
 
         file_path = event.src_path
 
-        if not file_path in ACTIVE_FILES:
-            ACTIVE_FILES[file_path] = FileProperties(file_path)
+        with ACTIVE_FILES as af:
+            if not (file_path in af):
+                af[file_path] = FileProperties(file_path)
 
         # Event is received as soon as the file is created, but
         # we have to wait until it is completely written
         while not is_file_copy_finished(file_path):
             time.sleep(1)
 
-        ACTIVE_FILES[file_path].complete = True
-        ACTIVE_FILES[file_path].modified = False
+        with ACTIVE_FILES as af:
+            if file_path in af:
+                af[file_path].complete = True
+                af[file_path].modified = False
 
         self._log('File: %s. Created and ready' % file_path)
 
     def on_modified(self, event):
+        global ACTIVE_FILES
         super().on_modified(event)
         file_path = event.src_path
 
-        if file_path not in ACTIVE_FILES:
-            # ignore
-            return
-
-        if ACTIVE_FILES[file_path].ts > 0:
-            now_ts = time.time()
-            last_ts = ACTIVE_FILES[file_path].ts
-            dt = now_ts - last_ts
-            if dt > .0:
-                ACTIVE_FILES[file_path].modified = True
+        with ACTIVE_FILES as af:
+            if (file_path in af) and (af[file_path].ts > 0):
+                now_ts = time.time()
+                last_ts = af[file_path].ts
+                dt = now_ts - last_ts
+                if dt > .0:
+                    af[file_path].modified = True
 
         self._log('File: %s. Modified' % file_path)
 
     def on_deleted(self, event):
+        global ACTIVE_FILES
         super().on_deleted(event)
         file_path = event.src_path
-        if file_path in ACTIVE_FILES:
-            del ACTIVE_FILES[file_path]
+        with ACTIVE_FILES as af:
+            if file_path in af:
+                del af[file_path]
 
         self._log('File: %s. Removed.' % file_path)
 
@@ -531,6 +536,7 @@ class WatchdogSvc(BaseWinservice):
         return dbapi
 
     def _main(self):
+        global ACTIVE_FILES
         self._dbapi = None
         try:
             self._log("Start v%s at %s" % (VERSION, time.ctime()))
@@ -577,37 +583,44 @@ class WatchdogSvc(BaseWinservice):
                 _allfiles = [os.path.join(dirpath, fname) for fname in allfiles]
                 self._log("Adding existing files: %s" % str(_allfiles))
                 for f in _allfiles:
-                    ACTIVE_FILES[f] = FileProperties(f)
-                    ACTIVE_FILES[f].complete = True
-                    ACTIVE_FILES[f].modified = True
+                    with ACTIVE_FILES as af:
+                        af[f] = FileProperties(f)
+                        af[f].complete = True
+                        af[f].modified = True
 
             event_handler = CustomEventHandler(self._log)
             observer = Observer()
             observer.schedule(event_handler, WATCHEDDIRPATH, recursive=True)
             observer.start()
             while not self.stop_requested:
-                keys = list(ACTIVE_FILES.keys())
-                for k in keys:
-                    mark4removal = False
-                    if not ACTIVE_FILES[k].complete:
-                        continue
+                
+                with ACTIVE_FILES as af:
+                    # Start with
+                    keys = list(af.keys())
+                    for k in keys:
+                        mark4removal = False
+                        if not af[k].complete:
+                            continue
 
-                    if ACTIVE_FILES[k].modified:
-                        now_ts = time.time()
-                        modified_last_ts = ACTIVE_FILES[k].ts
-                        dt = now_ts - modified_last_ts
-                        if dt > NOT_MODIFIED_SINCE_X_SECONDS:  # Assume ok if not modified for the last 10s
-                            ACTIVE_FILES[k].modified = False
-                    elif ACTIVE_FILES[k].hash_value == None:
-                        ACTIVE_FILES[k].hash_file()
-                        self._add_to_workqueue(ACTIVE_FILES[k])
-                        # mark for removal from pending
-                        mark4removal = True
+                        if af[k].modified:
+                            now_ts = time.time()
+                            modified_last_ts = af[k].ts
+                            dt = now_ts - modified_last_ts
+                            if dt > NOT_MODIFIED_SINCE_X_SECONDS:  # Assume ok if not modified for the last 10s
+                                af[k].modified = False
+                        elif af[k].hash_value is None:
+                            af[k].hash_file()
+                            itemWQ = af[k].asdataclass()
+                            self._add_to_workqueue(itemWQ)
+                            
+                            # mark for removal from pending
+                            mark4removal = True
 
-                    self._log(str(ACTIVE_FILES[k]))
+                        self._log(str(af[k]))
 
-                    if mark4removal:
-                        del ACTIVE_FILES[k]
+                        if mark4removal:
+                            del af[k]
+                    # End with
 
                 time.sleep(1)
 
@@ -625,13 +638,12 @@ class WatchdogSvc(BaseWinservice):
                 self._dbapi.end_from_thread('main')
                 self._dbapi.close()
 
-    def _add_to_workqueue(self, fp):
-        if not isinstance(fp, FileProperties):
+    def _add_to_workqueue(self, itemWQ):
+        if not itemWQ.hash_value:
+            self._log_error("The file %s doesnot have a calculated hash value" % str(itemWQ))
             return
-        if self._dbapi is None:
-            return
-        self._log("[DEBUG] Add to workqueue")
-        results = self._dbapi.execute('main', "select * from workqueue where hash_value = ?", (fp.hash_value,))
+        self._log("[DEBUG] Add to workqueue %s" % str(itemWQ))
+        results = self._dbapi.execute('main', "select * from workqueue where hash_value = ?", (itemWQ.hash_value,))
         # One way to detect an error in execute is to check the type of the returned value
         # it is a string, that is an error message otherwise its a sequence/list, it can be empty
         if isinstance(results, str):
@@ -642,9 +654,9 @@ class WatchdogSvc(BaseWinservice):
             print('[DEBUG]', row)
             found += 1
         if found == 0:
-            self._dbapi.execute('main', SQL_INSERT_INTO_T % (TABLE_WQ), asdict(fp.asdataclass()))
-        self._log("[DEBUG] Adding %s to wk" % str(fp))
-        WORKQUEUE.append(fp.asdataclass())
+            self._dbapi.execute('main', SQL_INSERT_INTO_T % (TABLE_WQ), asdict(itemWQ))
+        self._log("[DEBUG] Adding %s to wk" % str(itemWQ))
+        WORKQUEUE.append(itemWQ)
 
 
 class BaseBackgroundTask:
