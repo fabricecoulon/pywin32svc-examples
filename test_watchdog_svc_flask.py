@@ -44,8 +44,9 @@ from flask import Flask, render_template
 from datetime import datetime as dt
 from waitress import serve
 from enum import Enum
+from pydantic.dataclasses import dataclass
 
-VERSION = '0.7'
+VERSION = '0.8'
 WATCHEDDIRNAME = "watcheddir"
 WATCHEDDIRPARENT = "C:\\Temp\\watchdog"
 # Hardcode the absolute path to the watched directory
@@ -114,6 +115,9 @@ class DbApiBase:
                 loop_count += 1
         return res
 
+    def last_insert_rowid(self):
+        raise NotImplementedError
+
 
 # To avoid being stuck with the default sqlite3 module which is not
 # fit for anything that is multithreaded and because we only intend to
@@ -140,6 +144,11 @@ class DbApiSqlite3Worker(DbApiBase):
             raise Exception
         self._db.close()
         self._db = None
+
+    def last_insert_rowid(self, tid):
+        if self._db is None:
+            raise Exception('Call initdb first')
+        return self._db.execute("SELECT last_insert_rowid()")
 
 
 class DbApiAPSW(DbApiBase):
@@ -179,6 +188,21 @@ class DbApiAPSW(DbApiBase):
             raise DbApiException(e)
         return res
 
+    def last_insert_rowid(self, tid):
+        row_id = -1
+        if self._db is None:
+            raise Exception('Call initdb first')
+        if tid not in self._cursors:
+            raise RuntimeError("%s does not have an open cursor, call start_from_thread first" % tid)
+        try:
+            res = self._cursors[tid].execute("SELECT last_insert_rowid()")
+        except (apsw.SQLError, apsw.ConstraintError) as e:
+            raise DbApiException(e)
+        for r in res:
+            row_id = r[0]
+            break
+        return row_id
+
 
 class DbApiSqlite:
     def __init__(self, connection_string):
@@ -217,7 +241,7 @@ ACTIVE_FILES = ThreadSafeDict()
 WORKQUEUE = deque()
 
 
-def is_file_copy_finished(file_path):
+def is_file_copy_finished(filepath):
     """
     Used to check if the new file for which we received a new file event is completed
     https://stackoverflow.com/questions/32092645/python-watchdog-windows-wait-till-copy-finishes
@@ -229,7 +253,7 @@ def is_file_copy_finished(file_path):
     OPEN_EXISTING         = 3
     FILE_ATTRIBUTE_NORMAL = 0x80
 
-    h_file = windll.Kernel32.CreateFileW(file_path, GENERIC_WRITE, FILE_SHARE_READ, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+    h_file = windll.Kernel32.CreateFileW(filepath, GENERIC_WRITE, FILE_SHARE_READ, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
 
     if h_file != -1:
         windll.Kernel32.CloseHandle(h_file)
@@ -251,9 +275,19 @@ class FilePropsItem:
 class FilePropsItemCT(FilePropsItem):
     newfilepath: str = ''
 
+@dataclass
+class BackgoundTaskDef:
+    id: int
+    extensions: str
+    mimetype: str
+    last_update_t: int
+    background_task: str
+
+# FIXME: Create a class with methods that generate these SQL statements when passing dataclasses objects
 TABLE_WQ = "workqueue"
 TABLE_CT = "completed_tasks"
 TABLE_CT_HIST = "completed_tasks_hist"
+TABLE_BGT = "background_tasks"
 
 SQL_CREATE_WQ = """
     CREATE TABLE IF NOT EXISTS %s (
@@ -280,11 +314,41 @@ SQL_CREATE_CT_FMT = """
     )
 """
 
+SQL_CREATE_BGT_FMT = """
+    CREATE TABLE IF NOT EXISTS %s (
+            id INTEGER PRIMARY KEY,
+            extensions TEXT NOT NULL, -- comma separated list of extensions (.exe)
+            mimetype TEXT NOT NULL, -- application/octet-stream
+            last_update_t INTEGER,
+            background_task TEXT -- the name of the module containing the definition of the bg task
+    )
+"""
+
 SQL_CREATE_CT = SQL_CREATE_CT_FMT % (TABLE_CT)
 SQL_CREATE_CT_HIST = SQL_CREATE_CT_FMT % (TABLE_CT_HIST)
+SQL_CREATE_BGT = SQL_CREATE_BGT_FMT % (TABLE_BGT)
 
-TABLE_WQ_COLS = "id, filepath, hash_type, hash_value, create_t, last_update_t, status"
-TABLE_CT_COLS = TABLE_WQ_COLS + ", newfilepath"
+# FIXME: Generate these strings literals from the dataclasses (instance a dummy object)
+# The dictionary keys must be now ordered since Python 3.x
+# fp = FilePropsItem(-1, '', '', '', 0, 0, 0)
+# ', '.join([k for k in asdict(fp).keys() if k != 'id'])
+TABLE_WQ_COLS_NOID = "filepath, hash_type, hash_value, create_t, last_update_t, status"
+# asdict(fp).keys()
+TABLE_WQ_COLS = "id, " + TABLE_WQ_COLS_NOID
+
+# ':' + ', :'.join([k for k in asdict(fp).keys() if k != 'id'])
+TABLE_WQ_PARAMS = ":filepath, :hash_type, :hash_value, :create_t, :last_update_t, :status"
+
+# fp = FilePropsItemCT(-1, '', '', '', 0, 0, 0, '')
+# ', '.join([k for k in asdict(fp).keys() if k != 'id'])
+TABLE_CT_COLS_NOID = TABLE_WQ_COLS_NOID + ", newfilepath"
+# asdict(fp).keys()
+TABLE_CT_COLS = "id, " + TABLE_CT_COLS_NOID
+# ':' + ', :'.join([k for k in asdict(fp).keys() if k != 'id'])
+TABLE_CT_PARAMS = TABLE_WQ_PARAMS + ", :newfilepath"
+
+TABLE_BGT_COLS_NOID = "extensions, mimetype, last_update_t, background_task"
+TABLE_BGT_PARAMS = ":extensions, :mimetype, :last_update_t, :background_task"
 
 SQL_SELECT_C_FROM_T_WHERE = """
     SELECT %s FROM %s WHERE hash_value = :hash_value
@@ -294,8 +358,16 @@ SQL_SELECT_C_FROM_T_WHERE_ID = """
     SELECT %s FROM %s WHERE id = :id
 """
 
-SQL_INSERT_INTO_T = """
-    INSERT INTO %s (filepath, hash_type, hash_value, create_t, last_update_t, status) VALUES (:filepath, :hash_type, :hash_value, :create_t, :last_update_t, :status) 
+SQL_SELECT_ALL_FROM_T = """
+    SELECT * FROM %s
+"""
+
+#SQL_INSERT_INTO_T = """
+#    INSERT INTO %s (filepath, hash_type, hash_value, create_t, last_update_t, status) VALUES (:filepath, :hash_type, :hash_value, :create_t, :last_update_t, :status) 
+#"""
+
+SQL_INSERT_INTO_T_COLSNOID_VALUES_PARAMS = """
+    INSERT INTO %s (%s) VALUES (%s) 
 """
 
 # T1: TABLE_CT , T2: TABLE_CT_HIST
@@ -323,21 +395,22 @@ class Status(Enum):
     PENDING = 2
     UNKNOWN = 10
 
+FILEHASHERS =  { 'md5': FileHash('md5'), 'sha256': FileHash('sha256') }
 
 class FileProperties:
-    FILEHASHERS =  { 'md5': FileHash('md5'), 'sha256': FileHash('sha256') }
 
-    def __init__(self, filepath, hash_type='sha256'):
+    def __init__(self, filepath, hasher):
         self._filepath = filepath
         self._complete = False
         self._modified = False
         self._ts = 0
-        self._hash_type = hash_type
         try:
-            self._hasher = self.FILEHASHERS[self._hash_type]
-        except:
-            raise Exception('Unsupported hasher')
+            self._hash_type = hasher.hash_algorithm
+        except AttributeError:
+            self._hash_type = ''
+        self._hasher = hasher
         self._hash_value = None
+        self._resume = False
 
     @property
     def complete(self):
@@ -363,8 +436,23 @@ class FileProperties:
     def hash_value(self):
         return self._hash_value
 
+    @hash_value.setter
+    def hash_value(self, value):
+        self._hash_value = value
+        self._ts = time.time()
+
+    @property
+    def hash_type(self):
+        return self._hash_type
+
+    @hash_type.setter
+    def hash_type(self, value):
+        self._hash_type = value
+        self._ts = time.time()
+
     def hash_file(self):
-        self._hash_value = self._hasher.hash_file(self._filepath)
+        if self._hasher:
+            self._hash_value = self._hasher.hash_file(self._filepath)
         self._ts = time.time()
 
     @property
@@ -383,6 +471,16 @@ class FileProperties:
     def asdataclass(self):
         dc = FilePropsItem(-1, self._filepath, self._hash_type, self._hash_value, self._ts, self._ts, Status.NA.value)
         return dc
+
+    @property
+    def resume(self):
+        return self._resume
+
+    @resume.setter
+    def resume(self, value):
+        self._resume = value
+        self._complete = True
+        self._modified = False
 
 
 class BaseWinservice(win32serviceutil.ServiceFramework):
@@ -411,6 +509,8 @@ class BaseWinservice(win32serviceutil.ServiceFramework):
         logging.info(str(msg))
 
     def _log_error(self, msg):
+        # FIXME: logging handles call from multiple thread but not this servicemanager
+        # Use a lock around it or drop it
         servicemanager.LogErrorMsg(str(msg))
         logging.error(str(msg))
 
@@ -429,7 +529,7 @@ class BaseWinservice(win32serviceutil.ServiceFramework):
         self.main()
 
     def _configure_logging(self):
-        raise Exception("Override me")
+        raise NotImplementedError()
 
     def main(self):
         self._configure_logging()
@@ -438,7 +538,7 @@ class BaseWinservice(win32serviceutil.ServiceFramework):
         self._main()
 
     def _main(self):
-        raise Exception("Override me")
+        raise NotImplementedError()
 
     def _svc_excepthook(self, type, value, traceback):
         logging.error("Unhandled exception occured", exc_info=(type, value, traceback))
@@ -462,48 +562,48 @@ class CustomEventHandler(FileSystemEventHandler):
             self._log('Ignoring: %s' % event.src_path)
             return
 
-        file_path = event.src_path
+        _filepath = event.src_path
 
         with ACTIVE_FILES as af:
-            if not (file_path in af):
-                af[file_path] = FileProperties(file_path)
+            if not (_filepath in af):
+                af[_filepath] = FileProperties(_filepath, FILEHASHERS['sha256'])
 
         # Event is received as soon as the file is created, but
         # we have to wait until it is completely written
-        while not is_file_copy_finished(file_path):
+        while not is_file_copy_finished(_filepath):
             time.sleep(1)
 
         with ACTIVE_FILES as af:
-            if file_path in af:
-                af[file_path].complete = True
-                af[file_path].modified = False
+            if _filepath in af:
+                af[_filepath].complete = True
+                af[_filepath].modified = False
 
-        self._log('File: %s. Created and ready' % file_path)
+        self._log('File: %s. Created and ready' % _filepath)
 
     def on_modified(self, event):
         global ACTIVE_FILES
         super().on_modified(event)
-        file_path = event.src_path
+        _filepath = event.src_path
 
         with ACTIVE_FILES as af:
-            if (file_path in af) and (af[file_path].ts > 0):
+            if (_filepath in af) and (af[_filepath].ts > 0):
                 now_ts = time.time()
-                last_ts = af[file_path].ts
+                last_ts = af[_filepath].ts
                 dt = now_ts - last_ts
                 if dt > .0:
-                    af[file_path].modified = True
+                    af[_filepath].modified = True
 
-        self._log('File: %s. Modified' % file_path)
+        self._log('File: %s. Modified' % _filepath)
 
     def on_deleted(self, event):
         global ACTIVE_FILES
         super().on_deleted(event)
-        file_path = event.src_path
+        _filepath = event.src_path
         with ACTIVE_FILES as af:
-            if file_path in af:
-                del af[file_path]
+            if _filepath in af:
+                del af[_filepath]
 
-        self._log('File: %s. Removed.' % file_path)
+        self._log('File: %s. Removed.' % _filepath)
 
 class WatchdogSvc(BaseWinservice):
     """
@@ -515,9 +615,11 @@ class WatchdogSvc(BaseWinservice):
     _svc_name_ = "WatchdogSvc1"
     _svc_display_name_ = "Watchdog Service"
     _svc_description_ = "Watchdog Service"
+    _svc_tid = "main"
 
     def _configure_logging(self):
         l = logging.getLogger()
+        # FIXME: Make log level a parameter
         l.setLevel(logging.DEBUG)
         #l.setLevel(logging.ERROR)
         f = logging.Formatter('%(asctime)s %(process)d:%(thread)d %(name)s %(levelname)-8s %(message)s')
@@ -532,8 +634,51 @@ class WatchdogSvc(BaseWinservice):
 
     def _init_db(self):
         dbapi = DbApiSqlite(DBFILEPATH).get_dbapi_obj()
-        dbapi.start_from_thread('main')
+        dbapi.start_from_thread(self._svc_tid)
         return dbapi
+
+    def _close_db(self):
+        if self._dbapi is None:
+            return
+        self._dbapi.end_from_thread(self._svc_tid)
+        self._dbapi.close()
+
+    def _check_workqueue(self):
+        global ACTIVE_FILES
+        allfiles = []
+        # Traverse the watched directory for any remaining files and create
+        # FileProperties for them
+        for (dirpath, dirnames, filenames) in os.walk(WATCHEDDIRPATH):
+            allfiles.extend(filenames)
+            break  # Only level inside watcheddir
+        if allfiles:
+            _allfiles = [os.path.join(dirpath, fname) for fname in allfiles]
+            self._log("Adding existing files: %s" % str(_allfiles))
+            for f in _allfiles:
+                with ACTIVE_FILES as af:
+                    af[f] = FileProperties(f, FILEHASHERS['sha256'])
+                    af[f].complete = True
+                    af[f].modified = True
+        # Search workqueue table for any items that are pending but the original
+        # file at filepath might not be available at that location
+        results = self._dbapi.execute(self._svc_tid, "select %s from %s" % (TABLE_WQ_COLS, TABLE_WQ))
+        found = 0
+        for row in results:
+            itemWQ = FilePropsItem(*row)
+            if itemWQ.filepath not in af:
+                af[itemWQ.filepath] = FileProperties(itemWQ.filepath, None)
+                found += 1
+        # test
+        af['test1'] = FileProperties('test1', None)
+        af['test1'].hash_type = 'sha256'
+        af['test1'].hash_value = 'test1'
+        af['test1'].resume = True
+
+    def _read_settings(self):
+        for r in self._dbapi.execute(self._svc_tid, SQL_SELECT_ALL_FROM_T % TABLE_BGT):
+            print(r)
+        time.sleep(5)
+
 
     def _main(self):
         global ACTIVE_FILES
@@ -542,6 +687,8 @@ class WatchdogSvc(BaseWinservice):
             self._log("Start v%s at %s" % (VERSION, time.ctime()))
             self._log("Start db worker...")
             self._dbapi = self._init_db()
+            self._log("Reading applicaiton settings...")
+            self._read_settings()
             self._log("Start background threads...")
             # background thread for processing the work in WORKQUEUE
             background_t = Thread(
@@ -554,6 +701,7 @@ class WatchdogSvc(BaseWinservice):
                 daemon=True
             )
             background_t.start()
+            # background thread for serving a small flask app
             self._log("Start Flask...")
             flask_t = Thread(
                 target=flask_thread_processing,
@@ -575,18 +723,7 @@ class WatchdogSvc(BaseWinservice):
                 if (not os.path.exists(d)) or (not os.path.isdir(d)):
                     raise Exception('%s does not exists or is not a directory' % d)
 
-            allfiles = []
-            for (dirpath, dirnames, filenames) in os.walk(WATCHEDDIRPATH):
-                allfiles.extend(filenames)
-                break  # Only level inside watcheddir
-            if allfiles:
-                _allfiles = [os.path.join(dirpath, fname) for fname in allfiles]
-                self._log("Adding existing files: %s" % str(_allfiles))
-                for f in _allfiles:
-                    with ACTIVE_FILES as af:
-                        af[f] = FileProperties(f)
-                        af[f].complete = True
-                        af[f].modified = True
+            self._check_workqueue()
 
             event_handler = CustomEventHandler(self._log)
             observer = Observer()
@@ -608,8 +745,9 @@ class WatchdogSvc(BaseWinservice):
                             dt = now_ts - modified_last_ts
                             if dt > NOT_MODIFIED_SINCE_X_SECONDS:  # Assume ok if not modified for the last 10s
                                 af[k].modified = False
-                        elif af[k].hash_value is None:
-                            af[k].hash_file()
+                        elif af[k].resume or (not af[k].hash_value):
+                            if not af[k].resume:
+                                af[k].hash_file()
                             itemWQ = af[k].asdataclass()
                             self._add_to_workqueue(itemWQ)
                             
@@ -634,28 +772,25 @@ class WatchdogSvc(BaseWinservice):
             self._svc_excepthook(*sys.exc_info())
         
         finally:
-            if self._dbapi:
-                self._dbapi.end_from_thread('main')
-                self._dbapi.close()
+            self._close_db()
 
     def _add_to_workqueue(self, itemWQ):
         if not itemWQ.hash_value:
             self._log_error("The file %s doesnot have a calculated hash value" % str(itemWQ))
             return
-        self._log("[DEBUG] Add to workqueue %s" % str(itemWQ))
-        results = self._dbapi.execute('main', "select * from workqueue where hash_value = ?", (itemWQ.hash_value,))
+
+        results = self._dbapi.execute(self._svc_tid, "select * from %s where hash_value = ?" % TABLE_WQ, (itemWQ.hash_value,))
         # One way to detect an error in execute is to check the type of the returned value
         # it is a string, that is an error message otherwise its a sequence/list, it can be empty
         if isinstance(results, str):
-            self._log("[DEBUG] returning a string?!")
             return
         found = 0
         for row in results:
-            print('[DEBUG]', row)
             found += 1
         if found == 0:
-            self._dbapi.execute('main', SQL_INSERT_INTO_T % (TABLE_WQ), asdict(itemWQ))
-        self._log("[DEBUG] Adding %s to wk" % str(itemWQ))
+            self._dbapi.execute(self._svc_tid, SQL_INSERT_INTO_T_COLSNOID_VALUES_PARAMS % (TABLE_WQ, TABLE_WQ_COLS_NOID, TABLE_WQ_PARAMS), asdict(itemWQ))
+        self._log("Adding %s to wk" % str(itemWQ))
+
         WORKQUEUE.append(itemWQ)
 
 
@@ -670,13 +805,20 @@ class BaseBackgroundTask:
         self._id = self._item.id
         self._t = argdict['t']
         self._has_error = False
-        self._log = argdict['log']
+        self._log_fn = argdict['log']
+
+    def _log(self, msg):
+        if self._log_fn is not None:
+            self._log_fn(msg)
 
     def _pre_exec(self):
         pass
 
     def _post_exec(self):
         pass
+
+    def _execute(self):
+        time.sleep(self._t)
 
     def execute(self):
         """
@@ -685,7 +827,7 @@ class BaseBackgroundTask:
         self._log('[%d] processing %s...' % (self._id, str(self._item)))
         self._pre_exec()
         try:
-            time.sleep(self._t)
+            self._execute()
         except Exception as e:
             self._on_error(e)
         else:
@@ -751,6 +893,7 @@ def background_thread_processing(args):
     I instanciate X workers and I wait until I have a token to pass the work from the
     workqueue to the workers
     """
+    count = 0
     log = args['log']
     dbapi = args['dbapi']
     tid = args['tid']
@@ -774,6 +917,11 @@ def background_thread_processing(args):
                 token = tg.get_token()
                 if not (token >= 0):
                     # We did not get a valid token, wait
+                    if (count % 10 == 0):
+                        log('waiting for a valid token...')
+                    count += 1
+                    if count >= 100:
+                        count = 0
                     break
                 f = WORKQUEUE.popleft()
                 # Get the id from the table workqueue to pass it to the background_tasks
@@ -805,7 +953,7 @@ def background_thread_processing(args):
                     # We use the hash_value to know which row to update with the result,etc.
                     log(str(asdict(itemCT)))
                     try:
-                        dbapi.execute(tid, SQL_INSERT_INTO_T % (TABLE_CT), asdict(itemCT))
+                        dbapi.execute(tid, SQL_INSERT_INTO_T_COLSNOID_VALUES_PARAMS % (TABLE_CT, TABLE_CT_COLS_NOID, TABLE_CT_PARAMS), asdict(itemCT))
                     except DbApiException as e:
                         log(e)
                     #item_CT_HIST = None
@@ -932,11 +1080,12 @@ class ThisIsMyUnitTests(unittest.TestCase):
         dbapi.execute(tid, SQL_CREATE_WQ)
         dbapi.execute(tid, SQL_CREATE_CT)
         dbapi.execute(tid, SQL_CREATE_CT_HIST)
+        dbapi.execute(tid, SQL_CREATE_BGT)
         dbapi.end_from_thread(tid)
         dbapi.close()
 
     def test_fileprops(self):
-        file1 = FileProperties(DBFILEPATH)
+        file1 = FileProperties(DBFILEPATH, FILEHASHERS['sha256'])
         file1.hash_file()
         asdict(file1.asdataclass())
 
@@ -965,17 +1114,19 @@ class ThisIsMyUnitTests(unittest.TestCase):
         try:
             # Create
             if T == TABLE_WQ:
-                C = TABLE_WQ_COLS
+                C = TABLE_WQ_COLS_NOID
+                P = TABLE_WQ_PARAMS
                 dbapi.execute(tid, SQL_CREATE_WQ)
                 klass = FilePropsItem
             elif T == TABLE_CT:
-                C = TABLE_CT_COLS
+                C = TABLE_CT_COLS_NOID
+                P = TABLE_CT_PARAMS
                 dbapi.execute(tid, SQL_CREATE_CT)
                 klass = FilePropsItemCT
 
             # Insert
             for item in [item1, item2]:
-                dbapi.execute(tid, SQL_INSERT_INTO_T % (T), asdict(item))
+                dbapi.execute(tid, SQL_INSERT_INTO_T_COLSNOID_VALUES_PARAMS % (T, C, P), asdict(item))
 
             # Select
             results = dbapi.execute(tid, SQL_SELECT_C_FROM_T_WHERE % (C, T), {'hash_value': 'dummy_hash_value1'})
@@ -1022,8 +1173,8 @@ class ThisIsMyUnitTests(unittest.TestCase):
         dbapi = DbApiSqlite(':memory:').get_dbapi_obj()
         dbapi.start_from_thread(tid)
         dbapi.execute(tid, SQL_CREATE_CT)
-        item1 = FilePropsItemCT(-1, 'dummy_filepath', 'dummy_hashtype', 'dummy_hash_value1', 1, 2, Status.SUCCESS.value)
-        dbapi.execute(tid, SQL_INSERT_INTO_T % (TABLE_CT), asdict(item1))
+        item1 = FilePropsItemCT(-1, 'dummy_filepath', 'dummy_hashtype', 'dummy_hash_value1', 1, 2, Status.SUCCESS.value, 'dummy_newfilepath')
+        dbapi.execute(tid, SQL_INSERT_INTO_T_COLSNOID_VALUES_PARAMS % (TABLE_CT, TABLE_CT_COLS_NOID, TABLE_CT_PARAMS), asdict(item1))
         retry = 3
         itemCT = dbapi.execute_select_with_retry(tid, FilePropsItemCT, SQL_SELECT_C_FROM_T_WHERE_ID % (TABLE_CT_COLS, TABLE_CT), {'id': 1}, retry)
         self.assertTrue(itemCT is not None)
@@ -1043,8 +1194,9 @@ class ThisIsMyUnitTests(unittest.TestCase):
         dbapi.start_from_thread(tid)
         dbapi.execute(tid, SQL_CREATE_CT)
         dbapi.execute(tid, SQL_CREATE_CT_HIST)
-        item1 = FilePropsItemCT(-1, 'dummy_filepath', 'dummy_newfilepath', 'dummy_hashtype', 'dummy_hash_value1', 0, 0, Status.NA.value)
-        dbapi.execute(tid, SQL_INSERT_INTO_T % (TABLE_CT), asdict(item1))
+        item1 = FilePropsItemCT(-1, 'dummy_filepath', 'dummy_hashtype', 'dummy_hash_value1', 0, 0, Status.NA.value, 'dummy_newfilepath')
+        sql = SQL_INSERT_INTO_T_COLSNOID_VALUES_PARAMS % (TABLE_CT, TABLE_CT_COLS_NOID, TABLE_CT_PARAMS)
+        dbapi.execute(tid, sql, asdict(item1))
         itemCT = None
         itemCT_HIST = None
         retry = 5
@@ -1078,6 +1230,25 @@ class ThisIsMyUnitTests(unittest.TestCase):
 
     def test_copy_from_WQ_to_WQ(self):
         return self._test_copy_from_T_to_T(TABLE_WQ)
+
+    def test_dyn_load(self):
+        item1 = FilePropsItemCT(-1, 'dummy_filepath', 'dummy_hashtype', 'dummy_hash_value1', 0, 0, Status.NA.value, 'dummy_newfilepath')
+        name = "background_task1"
+        mod = __import__(name, fromlist=[''])
+        bg = mod.CustomBackgroundTask({'item': item1, 't': 0.1, 'log': None})
+        status, item = bg.execute()
+        self.assertTrue(status)
+
+    def test_insert_into_bgt_get_last_insert_rowid(self):
+        bgt_def = BackgoundTaskDef(-1, '.exe', 'application/octet-stream', 0, 'background_task1.py')
+        tid = 'main'
+        dbapi = DbApiSqlite(':memory:').get_dbapi_obj()
+        dbapi.start_from_thread(tid)
+        dbapi.execute(tid, SQL_CREATE_BGT)
+        dbapi.execute(tid, SQL_INSERT_INTO_T_COLSNOID_VALUES_PARAMS % (TABLE_BGT, TABLE_BGT_COLS_NOID, TABLE_BGT_PARAMS), asdict(bgt_def))
+        self.assertEqual(dbapi.last_insert_rowid(tid), 1)
+        dbapi.end_from_thread(tid)
+        dbapi.close()    
 
 
 if __name__ == '__main__':
